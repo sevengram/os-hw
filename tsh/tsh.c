@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <linux/limits.h>
 
 #include "errmsg.h"
 #include "job.h"
@@ -17,6 +19,9 @@
 /* Misc manifest constants */
 #define MAXLINE    1024   /* max line size */
 #define MAXARGS     128   /* max args on a command line */
+
+#define REDIRECT_OUT    0x1
+#define REDIRECT_IN     0x2
 
 /* command line prompt */
 char prompt[] = "tsh> ";
@@ -28,6 +33,12 @@ int builtin_cmd(char **argv, int input_fd, int output_fd);
 int parseline(const char *cmdline, char **argv);
 
 char *first_tok(const char *space, const char *input, const char *output, const char *pipe);
+
+int exec_output(char **argv, const char *filename);
+
+int exec_input(char **argv, const char *filename);
+
+int parse_redirect(char **argv, char *output_file, char *input_file);
 
 void usage(void);
 
@@ -90,7 +101,6 @@ int main(int argc, char **argv)
     exit(0); /* control never reaches here */
 }
 
-
 /*
  * eval - Evaluate the command line that the user has just typed in
  *
@@ -120,14 +130,32 @@ void eval(char *cmdline)
 
         if ((pid = fork()) == 0) {   /* Child */
             mask_signal(SIG_UNBLOCK, SIGCHLD);
-
             if (setpgid(0, 0) < 0) { /* put the child in a new process group */
                 unix_error("eval: setpgid failed");
             }
 
-            /* run the command */
+            char output_file[NAME_MAX];
+            char input_file[NAME_MAX];
+            int status = parse_redirect(argv, output_file, input_file);
+            int fd;
+            if (status & REDIRECT_OUT) {
+                if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
+                    app_error("Fail to create the file!");
+                    exit(1);
+                }
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+            if (status & REDIRECT_IN) {
+                if ((fd = open(input_file, O_RDONLY)) == -1) {
+                    app_error("Fail to open the file!");
+                    exit(1);
+                }
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
             if (execvp(argv[0], argv) < 0) {
-                printf("%s: Command not found.\n", argv[0]);
+                fprintf(stderr, "%s: Command not found.\n", argv[0]);
                 exit(1);
             }
         } else {/* Parent */
@@ -241,9 +269,38 @@ int parseline(const char *cmdline, char **argv)
     /* should the job run in the background? */
     if ((bg = (*argv[argc - 1] == '&')) != 0)
         argv[--argc] = NULL;
-
     return bg;
 }
+
+int parse_redirect(char **argv, char *output_file, char *input_file)
+{
+    int i = 0;
+    int argc = 0;
+    int status = 0;
+    int last = 0;
+    while (argv[i] != NULL) {
+        if (strcmp(argv[i], ">") == 0) {
+            last = REDIRECT_OUT;
+        } else if (strcmp(argv[i], "<") == 0) {
+            last = REDIRECT_IN;
+        } else {
+            if (last == 0) {
+                argv[argc++] = argv[i];
+            } else if (last == REDIRECT_OUT) {
+                strcpy(output_file, argv[i]);
+                status |= REDIRECT_OUT;
+            } else if (last == REDIRECT_IN) {
+                strcpy(input_file, argv[i]);
+                status |= REDIRECT_IN;
+            }
+            last = 0;
+        }
+        i++;
+    }
+    argv[argc] = NULL;
+    return status;
+}
+
 
 /*
  * first_tok - Returns a pointer to the first (lowest addy) of the four pointers
@@ -252,8 +309,8 @@ int parseline(const char *cmdline, char **argv)
 char *first_tok(const char *space, const char *input, const char *output, const char *pipe)
 {
     const char *possible[4];
-    unsigned int min;
-    int i = 1, n = 0;
+    unsigned long min;
+    int n = 0;
     if (space == NULL && input == NULL && output == NULL && pipe == NULL)
         return NULL;
     if (space != NULL) {
@@ -268,10 +325,10 @@ char *first_tok(const char *space, const char *input, const char *output, const 
     if (pipe != NULL) {
         possible[n++] = pipe;
     }
-    min = (unsigned) possible[0];
-    for (; i < n; i++) {
-        if (((unsigned) possible[i]) < min)
-            min = (unsigned) possible[i];
+    min = (unsigned long) possible[0];
+    for (int i = 1; i < n; i++) {
+        if (((unsigned long) possible[i]) < min)
+            min = (unsigned long) possible[i];
     }
     return (char *) min;
 }
