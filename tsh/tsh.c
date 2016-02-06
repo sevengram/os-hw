@@ -9,8 +9,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <signal.h>
-#include <fcntl.h>
+#include <sys/wait.h>
 #include <linux/limits.h>
+#include <fcntl.h>
 
 #include "errmsg.h"
 #include "job.h"
@@ -19,6 +20,7 @@
 /* Misc manifest constants */
 #define MAXLINE    1024   /* max line size */
 #define MAXARGS     128   /* max args on a command line */
+#define MAXPIPE     128
 
 #define REDIRECT_OUT    0x1
 #define REDIRECT_IN     0x2
@@ -34,13 +36,27 @@ int parseline(const char *cmdline, char **argv);
 
 char *first_tok(const char *space, const char *input, const char *output, const char *pipe);
 
-int exec_output(char **argv, const char *filename);
-
-int exec_input(char **argv, const char *filename);
-
 int parse_redirect(char **argv, char *output_file, char *input_file);
 
+int parse_pipe(char **argv, int *cmd_postions);
+
+int pipe_exec(char **argv, int *pos, int cmd_count);
+
 void usage(void);
+
+/*
+ * For debug
+ */
+void print_argv(char **argv)
+{
+    for (int i = 0; i < MAXARGS; i++) {
+        if (i != MAXARGS - 1 && argv[i] == NULL && argv[i + 1] == NULL) {
+            break;
+        }
+        printf(argv[i] != NULL ? argv[i] : "");
+        printf("\n");
+    }
+}
 
 /*
  * main - The shell's main routine
@@ -133,31 +149,39 @@ void eval(char *cmdline)
             if (setpgid(0, 0) < 0) { /* put the child in a new process group */
                 unix_error("eval: setpgid failed");
             }
-
-            char output_file[NAME_MAX];
-            char input_file[NAME_MAX];
-            int status = parse_redirect(argv, output_file, input_file);
-            int fd;
-            if (status & REDIRECT_OUT) {
-                if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
-                    app_error("Fail to create the file!");
+            int cmd_postions[MAXPIPE];
+            int cmd_count = parse_pipe(argv, cmd_postions);
+            if (cmd_count > 1) {
+                if (pipe_exec(argv, cmd_postions, cmd_count) < 0) {
                     exit(1);
                 }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            }
-            if (status & REDIRECT_IN) {
-                if ((fd = open(input_file, O_RDONLY)) == -1) {
-                    app_error("Fail to open the file!");
+            } else {
+                char output_file[NAME_MAX];
+                char input_file[NAME_MAX];
+                int status = parse_redirect(argv, output_file, input_file);
+                int fd;
+                if (status & REDIRECT_OUT) {
+                    if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
+                        app_error("Fail to create the file!");
+                        exit(1);
+                    }
+                    dup2(fd, STDOUT_FILENO);
+                    close(fd);
+                }
+                if (status & REDIRECT_IN) {
+                    if ((fd = open(input_file, O_RDONLY)) == -1) {
+                        app_error("Fail to open the file!");
+                        exit(1);
+                    }
+                    dup2(fd, STDIN_FILENO);
+                    close(fd);
+                }
+                if (execvp(argv[0], argv) < 0) {
+                    fprintf(stderr, "%s: Command not found.\n", argv[0]);
                     exit(1);
                 }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
             }
-            if (execvp(argv[0], argv) < 0) {
-                fprintf(stderr, "%s: Command not found.\n", argv[0]);
-                exit(1);
-            }
+            exit(0);
         } else {/* Parent */
             if (!bg)
                 addjob(jobs, pid, FG, cmdline);
@@ -175,6 +199,51 @@ void eval(char *cmdline)
     }
     return;
 }
+
+int pipe_exec(char **argv, int *pos, int cmd_count)
+{
+    int i, j, k;
+    int result;
+    int status;
+    int pipe_count = cmd_count - 1;
+    int pipefds[2 * pipe_count];
+    for (i = 0; i < pipe_count; i++) {
+        if (pipe(pipefds + i * 2) < 0) {
+            fprintf(stderr, "couldn't pipe");
+            return -1;
+        }
+    }
+    j = 0;
+    result = 0;
+    for (i = 0; i < cmd_count; i++, j += 2) {
+        if (fork() == 0) {
+            if (i != cmd_count - 1) {
+                dup2(pipefds[j + 1], STDOUT_FILENO);
+            }
+            if (i != 0) {
+                dup2(pipefds[j - 2], STDIN_FILENO);
+            }
+            for (k = 0; k < 2 * pipe_count; k++) {
+                if (k != j + 1 && k != j - 2) {
+                    close(pipefds[k]);
+                }
+            }
+            if (execvp(argv[pos[i]], argv + pos[i]) < 0) {
+                fprintf(stderr, "%s: Command not found.\n", argv[pos[i]]);
+                exit(1);
+            }
+        }
+    }
+    for (i = 0; i < 2 * pipe_count; i++) {
+        close(pipefds[i]);
+    }
+    for (i = 0; i < cmd_count; i++) {
+        wait(&status);
+        result |= status;
+    }
+    return result == 0 ? 0 : -1;
+}
+
 
 /*
  * builtin_cmd - If the user has typed a built-in command then execute
@@ -299,6 +368,23 @@ int parse_redirect(char **argv, char *output_file, char *input_file)
     }
     argv[argc] = NULL;
     return status;
+}
+
+int parse_pipe(char **argv, int *cmd_postions)
+{
+    int i = 0;
+    int j = 1;
+    cmd_postions[0] = 0;
+    while (argv[i] != NULL) {
+        if (strcmp(argv[i], "|") == 0 && i != 0) {
+            if (i != MAXARGS - 1 && argv[i + 1] != NULL) {
+                cmd_postions[j++] = i + 1;
+            }
+            argv[i] = NULL;
+        }
+        i++;
+    }
+    return j;
 }
 
 
