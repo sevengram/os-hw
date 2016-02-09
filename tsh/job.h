@@ -1,7 +1,6 @@
 #ifndef OS_HW_JOB_H
 #define OS_HW_JOB_H
 
-#define MAXJID    1<<16   /* max job ID */
 #define MAXJOBS      16   /* max jobs at any point in time */
 #define MAXLINE    1024   /* max line size */
 
@@ -36,7 +35,7 @@ struct job_t jobs[MAXJOBS];
 
 void initjobs(struct job_t *jobs);
 
-int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline);
+int addjob(struct job_t *jobs, pid_t pid, int state, const char *cmdline);
 
 int deletejob(struct job_t *jobs, pid_t pid);
 

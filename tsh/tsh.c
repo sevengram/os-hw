@@ -18,17 +18,26 @@
 #include "sigutil.h"
 
 /* Misc manifest constants */
-#define MAXLINE    1024   /* max line size */
-#define MAXARGS     128   /* max args on a command line */
-#define MAXPIPE     128
+#define MAXLINE         1024   /* max line size */
+#define MAXARGS         128   /* max args on a command line */
+#define MAXPIPE         128
+#define HISTORY_LIMIT   256
 
 #define REDIRECT_OUT    0x1
 #define REDIRECT_IN     0x2
 
-/* command line prompt */
-char prompt[] = "tsh> ";
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+#define SUB(X, Y) (((X) > (Y)) ? ((X)-(Y)) : ((Y)-(X)))
 
-void eval(char *cmdline);
+
+/* command line prompt */
+static char prompt[] = "tsh> ";
+
+static int current = 0;
+
+static char cmdlines[HISTORY_LIMIT][MAXLINE];
+
+void eval(const char *cmdline);
 
 int builtin_cmd(char **argv, int input_fd, int output_fd);
 
@@ -41,6 +50,12 @@ int parse_redirect(char **argv, char *output_file, char *input_file);
 int parse_pipe(char **argv, int *cmd_postions);
 
 int pipe_exec(char **argv, int *pos, int cmd_count);
+
+void save_history(const char *cmd);
+
+void run(const char *cmdline, int bg, char **argv);
+
+void history_exec(int start, int n);
 
 void usage(void);
 
@@ -65,7 +80,8 @@ int main(int argc, char **argv)
 {
     char c;
     char cmdline[MAXLINE];
-    int emit_prompt = 1; /* emit prompt (default) */
+    FILE *fp;
+    int bash_mode = 0; /* emit prompt (default) */
 
     /* Redirect stderr to stdout (so that driver will get all output
      * on the pipe connected to stdout) */
@@ -78,7 +94,7 @@ int main(int argc, char **argv)
                 usage();
                 break;
             case 'p':             /* don't print a prompt */
-                emit_prompt = 0;  /* handy for automatic testing */
+                bash_mode = 0;  /* handy for automatic testing */
                 break;
             default:
                 usage();
@@ -94,18 +110,28 @@ int main(int argc, char **argv)
     /* Initialize the job list */
     initjobs(jobs);
 
+    if (argc > 1 && argv[1][0] != '-') {
+        fp = fopen(argv[1], "r");
+        bash_mode = 1;
+    } else {
+        fp = stdin;
+    }
+
     /* Execute the shell's read/eval loop */
     while (1) {
         /* Read command line */
-        if (emit_prompt) {
+        if (!bash_mode) {
             printf("%s", prompt);
             fflush(stdout);
         }
-        if ((fgets(cmdline, MAXLINE, stdin) == NULL) && ferror(stdin))
+        if ((fgets(cmdline, MAXLINE, fp) == NULL) && ferror(fp))
             app_error("fgets error");
-        if (feof(stdin)) { /* End of file (ctrl-d) */
+        if (feof(fp)) { /* End of file (ctrl-d) */
             fflush(stdout);
             exit(0);
+        }
+        if (bash_mode) {
+            printf("%s", cmdline);
         }
 
         /* Evaluate the command line */
@@ -128,76 +154,78 @@ int main(int argc, char **argv)
  * background children don't receive SIGINT (SIGTSTP) from the kernel
  * when we type ctrl-c (ctrl-z) at the keyboard.
  */
-void eval(char *cmdline)
+void eval(const char *cmdline)
 {
     char *argv[MAXARGS];    /* Argument list execve() */
     char buf[MAXLINE];
     int bg;                 /* Should the job run in bg or fg? */
-    pid_t pid;
-
     strcpy(buf, cmdline);
     bg = parseline(buf, argv);
-
-    if (argv[0] == NULL)
-        return; /* Ignore empty lines */
-
-    if (!builtin_cmd(argv, STDIN_FILENO, STDOUT_FILENO)) {
-        mask_signal(SIG_BLOCK, SIGCHLD);
-
-        if ((pid = fork()) == 0) {   /* Child */
-            mask_signal(SIG_UNBLOCK, SIGCHLD);
-            if (setpgid(0, 0) < 0) { /* put the child in a new process group */
-                unix_error("eval: setpgid failed");
-            }
-            int cmd_postions[MAXPIPE];
-            int cmd_count = parse_pipe(argv, cmd_postions);
-            if (cmd_count > 1) {
-                if (pipe_exec(argv, cmd_postions, cmd_count) < 0) {
-                    exit(1);
-                }
-            } else {
-                char output_file[NAME_MAX];
-                char input_file[NAME_MAX];
-                int status = parse_redirect(argv, output_file, input_file);
-                int fd;
-                if (status & REDIRECT_OUT) {
-                    if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
-                        app_error("Fail to create the file!");
-                        exit(1);
-                    }
-                    dup2(fd, STDOUT_FILENO);
-                    close(fd);
-                }
-                if (status & REDIRECT_IN) {
-                    if ((fd = open(input_file, O_RDONLY)) == -1) {
-                        app_error("Fail to open the file!");
-                        exit(1);
-                    }
-                    dup2(fd, STDIN_FILENO);
-                    close(fd);
-                }
-                if (execvp(argv[0], argv) < 0) {
-                    fprintf(stderr, "%s: Command not found.\n", argv[0]);
-                    exit(1);
-                }
-            }
-            exit(0);
-        } else {/* Parent */
-            if (!bg)
-                addjob(jobs, pid, FG, cmdline);
-            else
-                addjob(jobs, pid, BG, cmdline);
-
-            mask_signal(SIG_UNBLOCK, SIGCHLD);
-
-            /* handle the started job */
-            if (!bg)
-                waitfg(pid, STDOUT_FILENO);
-            else
-                printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
-        }
+    if (argv[0] != NULL && !builtin_cmd(argv, STDIN_FILENO, STDOUT_FILENO)) {
+        run(cmdline, bg, argv);
     }
     return;
+}
+
+void run(const char *cmdline, int bg, char **argv)
+{
+    pid_t pid;
+    mask_signal(SIG_BLOCK, SIGCHLD);
+
+    if ((pid = fork()) == 0) {   /* Child */
+        mask_signal(SIG_UNBLOCK, SIGCHLD);
+        if (setpgid(0, 0) < 0) { /* put the child in a new process group */
+            unix_error("eval: setpgid failed");
+        }
+        int cmd_postions[MAXPIPE];
+        int cmd_count = parse_pipe(argv, cmd_postions);
+        if (cmd_count > 1) {
+            if (pipe_exec(argv, cmd_postions, cmd_count) < 0) {
+                exit(1);
+            }
+        } else {
+            char output_file[NAME_MAX];
+            char input_file[NAME_MAX];
+            int status = parse_redirect(argv, output_file, input_file);
+            int fd;
+            if (status & REDIRECT_OUT) {
+                if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
+                    app_error("Fail to create the file!");
+                    exit(1);
+                }
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+            if (status & REDIRECT_IN) {
+                if ((fd = open(input_file, O_RDONLY)) == -1) {
+                    app_error("Fail to open the file!");
+                    exit(1);
+                }
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+            if (execvp(argv[0], argv) < 0) {
+                fprintf(stderr, "%s: Command not found.\n", argv[0]);
+                exit(1);
+            }
+        }
+        exit(0);
+    } else {/* Parent */
+        save_history(cmdline);
+
+        if (!bg)
+            addjob(jobs, pid, FG, cmdline);
+        else
+            addjob(jobs, pid, BG, cmdline);
+
+        mask_signal(SIG_UNBLOCK, SIGCHLD);
+
+        /* handle the started job */
+        if (!bg)
+            waitfg(pid, STDOUT_FILENO);
+        else
+            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+    }
 }
 
 int pipe_exec(char **argv, int *pos, int cmd_count)
@@ -251,7 +279,10 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
  */
 int builtin_cmd(char **argv, int input_fd, int output_fd)
 {
+    // TODO: add cd
     if (!strcmp(argv[0], "quit")) /* quit command */
+        exit(0);
+    if (!strcmp(argv[0], "exit")) /* quit command */
         exit(0);
     if (!strcmp(argv[0], "&"))    /* Ignore singleton & */
         return 1;
@@ -261,6 +292,17 @@ int builtin_cmd(char **argv, int input_fd, int output_fd)
     }
     if (!strcmp(argv[0], "bg") || !(strcmp(argv[0], "fg"))) {
         do_bgfg(argv, output_fd);
+        return 1;
+    }
+    if (!strcmp(argv[0], "fc")) {
+        if (argv[1][0] == '-' && argv[2][0] == '-') {
+            int a = atoi(argv[1] + 1);
+            int b = atoi(argv[2] + 1);
+            int start = (current - MAX(a, b) + HISTORY_LIMIT) % HISTORY_LIMIT;
+            history_exec(start, SUB(a, b) + 1);
+        } else {
+            fprintf(stderr, "fc command argument error!\n");
+        }
         return 1;
     }
     return 0;
@@ -387,6 +429,31 @@ int parse_pipe(char **argv, int *cmd_postions)
     return j;
 }
 
+void save_history(const char *cmd)
+{
+    strcpy(cmdlines[current], cmd);
+    current = (current + 1) % HISTORY_LIMIT;
+}
+
+void history_exec(int start, int n)
+{
+    int bg;                 /* Should the job run in bg or fg? */
+    const char *cmd;
+    char *argv[MAXARGS];    /* Argument list execve() */
+    char buf[MAXLINE];
+    if (0 <= start && start < HISTORY_LIMIT) {
+        for (int i = 0; i < n; i++) {
+            cmd = cmdlines[(start + i) % HISTORY_LIMIT];
+            if (strlen(cmd) != 0) {
+                strcpy(buf, cmd);
+                bg = parseline(buf, argv);
+                if (argv[0] != NULL) {
+                    run(cmd, bg, argv);
+                }
+            }
+        }
+    }
+}
 
 /*
  * first_tok - Returns a pointer to the first (lowest addy) of the four pointers
