@@ -12,13 +12,14 @@
 #include <sys/wait.h>
 #include <linux/limits.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "errmsg.h"
 #include "job.h"
 #include "sigutil.h"
 
 /* Misc manifest constants */
-#define MAXLINE         1024   /* max line size */
+#define MAXLINE         1024  /* max line size */
 #define MAXARGS         128   /* max args on a command line */
 #define MAXPIPE         128
 #define HISTORY_LIMIT   256
@@ -31,19 +32,17 @@
 
 
 /* command line prompt */
-static char prompt[] = "tsh> ";
-
 static int current = 0;
 
 static char cmdlines[HISTORY_LIMIT][MAXLINE];
 
+static char cwd[MAXLINE];
+
 void eval(const char *cmdline);
 
-int builtin_cmd(char **argv, int input_fd, int output_fd);
+void fork_run(const char *cmdline, char **argv, int bg);
 
-int parseline(const char *cmdline, char **argv);
-
-char *first_tok(const char *space, const char *input, const char *output, const char *pipe);
+int parse_line(const char *cmdline, int *p_argc, char **argv);
 
 int parse_redirect(char **argv, char *output_file, char *input_file);
 
@@ -51,27 +50,13 @@ int parse_pipe(char **argv, int *cmd_postions);
 
 int pipe_exec(char **argv, int *pos, int cmd_count);
 
-void save_history(const char *cmd);
-
-void run(const char *cmdline, int bg, char **argv);
-
 void history_exec(int start, int n);
 
-void usage(void);
+void save_history(const char *cmd);
 
-/*
- * For debug
- */
-void print_argv(char **argv)
-{
-    for (int i = 0; i < MAXARGS; i++) {
-        if (i != MAXARGS - 1 && argv[i] == NULL && argv[i + 1] == NULL) {
-            break;
-        }
-        printf(argv[i] != NULL ? argv[i] : "");
-        printf("\n");
-    }
-}
+void change_dir(const char *path);
+
+void usage(void);
 
 /*
  * main - The shell's main routine
@@ -121,7 +106,8 @@ int main(int argc, char **argv)
     while (1) {
         /* Read command line */
         if (!bash_mode) {
-            printf("%s", prompt);
+            getcwd(cwd, MAXLINE);
+            printf("%s $ ", cwd);
             fflush(stdout);
         }
         if ((fgets(cmdline, MAXLINE, fp) == NULL) && ferror(fp))
@@ -143,31 +129,48 @@ int main(int argc, char **argv)
     exit(0); /* control never reaches here */
 }
 
-/*
- * eval - Evaluate the command line that the user has just typed in
- *
- * If the user has requested a built-in command (quit, jobs, bg or fg)
- * then execute it immediately. Otherwise, fork a child process and
- * run the job in the context of the child. If the job is running in
- * the foreground, wait for it to terminate and then return.  Note:
- * each child process must have a unique process group ID so that our
- * background children don't receive SIGINT (SIGTSTP) from the kernel
- * when we type ctrl-c (ctrl-z) at the keyboard.
- */
-void eval(const char *cmdline)
+
+int single_exec(char **argv)
 {
-    char *argv[MAXARGS];    /* Argument list execve() */
-    char buf[MAXLINE];
-    int bg;                 /* Should the job run in bg or fg? */
-    strcpy(buf, cmdline);
-    bg = parseline(buf, argv);
-    if (argv[0] != NULL && !builtin_cmd(argv, STDIN_FILENO, STDOUT_FILENO)) {
-        run(cmdline, bg, argv);
+    char output_file[NAME_MAX];
+    char input_file[NAME_MAX];
+    int status = parse_redirect(argv, output_file, input_file);
+    int fd;
+    if (status & REDIRECT_OUT) {
+        if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
+            app_error("Fail to create the file!");
+            return -1;
+        }
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
     }
-    return;
+    if (status & REDIRECT_IN) {
+        if ((fd = open(input_file, O_RDONLY)) == -1) {
+            app_error("Fail to open the file!");
+            return -1;
+        }
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+    if (execvp(argv[0], argv) < 0) {
+        fprintf(stderr, "%s: Command not found.\n", argv[0]);
+        return -1;
+    }
+    return 0;
 }
 
-void run(const char *cmdline, int bg, char **argv)
+int line_exec(char **argv)
+{
+    int cmd_postions[MAXPIPE];
+    int cmd_count = parse_pipe(argv, cmd_postions);
+    if (cmd_count > 1) {
+        return pipe_exec(argv, cmd_postions, cmd_count);
+    } else {
+        return single_exec(argv);
+    }
+}
+
+void fork_run(const char *cmdline, char **argv, int bg)
 {
     pid_t pid;
     mask_signal(SIG_BLOCK, SIGCHLD);
@@ -177,42 +180,12 @@ void run(const char *cmdline, int bg, char **argv)
         if (setpgid(0, 0) < 0) { /* put the child in a new process group */
             unix_error("eval: setpgid failed");
         }
-        int cmd_postions[MAXPIPE];
-        int cmd_count = parse_pipe(argv, cmd_postions);
-        if (cmd_count > 1) {
-            if (pipe_exec(argv, cmd_postions, cmd_count) < 0) {
-                exit(1);
-            }
+        if (line_exec (argv) == 0) {
+            exit(0);
         } else {
-            char output_file[NAME_MAX];
-            char input_file[NAME_MAX];
-            int status = parse_redirect(argv, output_file, input_file);
-            int fd;
-            if (status & REDIRECT_OUT) {
-                if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
-                    app_error("Fail to create the file!");
-                    exit(1);
-                }
-                dup2(fd, STDOUT_FILENO);
-                close(fd);
-            }
-            if (status & REDIRECT_IN) {
-                if ((fd = open(input_file, O_RDONLY)) == -1) {
-                    app_error("Fail to open the file!");
-                    exit(1);
-                }
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            }
-            if (execvp(argv[0], argv) < 0) {
-                fprintf(stderr, "%s: Command not found.\n", argv[0]);
-                exit(1);
-            }
+            exit(1);
         }
-        exit(0);
     } else {/* Parent */
-        save_history(cmdline);
-
         if (!bg)
             addjob(jobs, pid, FG, cmdline);
         else
@@ -256,8 +229,7 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
                     close(pipefds[k]);
                 }
             }
-            if (execvp(argv[pos[i]], argv + pos[i]) < 0) {
-                fprintf(stderr, "%s: Command not found.\n", argv[pos[i]]);
+            if (single_exec(argv + pos[i]) < 0) {
                 exit(1);
             }
         }
@@ -272,14 +244,12 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
     return result == 0 ? 0 : -1;
 }
 
-
 /*
  * builtin_cmd - If the user has typed a built-in command then execute
  *    it immediately.
  */
-int builtin_cmd(char **argv, int input_fd, int output_fd)
+int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
 {
-    // TODO: add cd
     if (!strcmp(argv[0], "quit")) /* quit command */
         exit(0);
     if (!strcmp(argv[0], "exit")) /* quit command */
@@ -290,30 +260,171 @@ int builtin_cmd(char **argv, int input_fd, int output_fd)
         listjobs(jobs, output_fd);
         return 1;
     }
+    if (!strcmp(argv[0], "cd")) {
+        if (argc >= 2) {
+            change_dir(argv[1]);
+        }
+        return 1;
+    }
     if (!strcmp(argv[0], "bg") || !(strcmp(argv[0], "fg"))) {
         do_bgfg(argv, output_fd);
         return 1;
     }
     if (!strcmp(argv[0], "fc")) {
-        if (argv[1][0] == '-' && argv[2][0] == '-') {
+        if (argc >= 3 && argv[1][0] == '-' && argv[2][0] == '-') {
             int a = atoi(argv[1] + 1);
             int b = atoi(argv[2] + 1);
             int start = (current - MAX(a, b) + HISTORY_LIMIT) % HISTORY_LIMIT;
             history_exec(start, SUB(a, b) + 1);
         } else {
-            fprintf(stderr, "fc command argument error!\n");
+            fprintf(stderr, "fc: argument error!\n");
         }
         return 1;
     }
     return 0;
 }
 
+
 /*
-* parseline - Parse the command line and build the argv array.
+ * eval - Evaluate the command line that the user has just typed in
+ *
+ * If the user has requested a built-in command (quit, jobs, bg or fg)
+ * then execute it immediately. Otherwise, fork a child process and
+ * run the job in the context of the child. If the job is running in
+ * the foreground, wait for it to terminate and then return.  Note:
+ * each child process must have a unique process group ID so that our
+ * background children don't receive SIGINT (SIGTSTP) from the kernel
+ * when we type ctrl-c (ctrl-z) at the keyboard.
+ */
+void eval(const char *cmdline)
+{
+    char *argv[MAXARGS];    /* Argument list execve() */
+    char buf[MAXLINE];
+    int bg;                 /* Should the job run in bg or fg? */
+    int argc;
+    strcpy(buf, cmdline);
+    bg = parse_line(buf, &argc, argv);
+    if (argv[0] != NULL && !builtin_cmd(argc, argv, STDIN_FILENO, STDOUT_FILENO)) {
+        fork_run(cmdline, argv, bg);
+    }
+    if (argv[0] != NULL && strcmp(argv[0], "fc") != 0) {
+        save_history(cmdline);
+    }
+    return;
+}
+
+
+int parse_redirect(char **argv, char *output_file, char *input_file)
+{
+    int i = 0;
+    int argc = 0;
+    int status = 0;
+    int last = 0;
+    while (argv[i] != NULL) {
+        if (strcmp(argv[i], ">") == 0) {
+            last = REDIRECT_OUT;
+        } else if (strcmp(argv[i], "<") == 0) {
+            last = REDIRECT_IN;
+        } else {
+            if (last == 0) {
+                argv[argc++] = argv[i];
+            } else if (last == REDIRECT_OUT) {
+                strcpy(output_file, argv[i]);
+                status |= REDIRECT_OUT;
+            } else if (last == REDIRECT_IN) {
+                strcpy(input_file, argv[i]);
+                status |= REDIRECT_IN;
+            }
+            last = 0;
+        }
+        i++;
+    }
+    argv[argc] = NULL;
+    return status;
+}
+
+int parse_pipe(char **argv, int *cmd_postions)
+{
+    int i = 0;
+    int j = 1;
+    cmd_postions[0] = 0;
+    while (argv[i] != NULL) {
+        if (strcmp(argv[i], "|") == 0 && i != 0) {
+            if (i != MAXARGS - 1 && argv[i + 1] != NULL) {
+                cmd_postions[j++] = i + 1;
+            }
+            argv[i] = NULL;
+        }
+        i++;
+    }
+    return j;
+}
+
+void save_history(const char *cmd)
+{
+    strcpy(cmdlines[current], cmd);
+    current = (current + 1) % HISTORY_LIMIT;
+}
+
+void history_exec(int start, int n)
+{
+    const char *cmd;
+    if (0 <= start && start < HISTORY_LIMIT) {
+        for (int i = 0; i < n; i++) {
+            cmd = cmdlines[(start + i) % HISTORY_LIMIT];
+            eval(cmd);
+        }
+    }
+}
+
+/*
+ * first_tok - Returns a pointer to the first (lowest addy) of the four pointers
+ *     that isn't NULL.
+ */
+char *first_tok(const char *space, const char *input, const char *output, const char *pipe)
+{
+    const char *possible[4];
+    unsigned long min;
+    int n = 0;
+    if (space == NULL && input == NULL && output == NULL && pipe == NULL)
+        return NULL;
+    if (space != NULL) {
+        possible[n++] = space;
+    }
+    if (input != NULL) {
+        possible[n++] = input;
+    }
+    if (output != NULL) {
+        possible[n++] = output;
+    }
+    if (pipe != NULL) {
+        possible[n++] = pipe;
+    }
+    min = (unsigned long) possible[0];
+    for (int i = 1; i < n; i++) {
+        if (((unsigned long) possible[i]) < min)
+            min = (unsigned long) possible[i];
+    }
+    return (char *) min;
+}
+
+/*
+ * usage - print a help message
+ */
+void usage(void)
+{
+    printf("Usage: shell [-hvp]\n");
+    printf("   -h   print this message\n");
+    printf("   -p   do not emit a command prompt\n");
+    exit(1);
+}
+
+/*
+* parse_line - Parse the command line and build the argv array.
 * Return true (1) if the user has requested a BG job, false
 * if the user has requested a FG job.
 */
-int parseline(const char *cmdline, char **argv)
+int parse_line(const char *cmdline, int *p_argc, char **argv)
 {
     static char array[MAXLINE]; /* holds local copy of command line */
     char *buf = array;          /* ptr that traverses command line */
@@ -322,7 +433,7 @@ int parseline(const char *cmdline, char **argv)
     char *delim_out;            /* points to the first > delimiter */
     char *delim_pipe;           /* points to the first | delimiter */
     char *delim;                /* points to the first delimiter */
-    int argc;                   /* number of args */
+    int argc;               /* number of args */
     int bg;                     /* background job? */
     char *last_space = NULL;    /* The address of the last space  */
 
@@ -380,119 +491,19 @@ int parseline(const char *cmdline, char **argv)
     /* should the job run in the background? */
     if ((bg = (*argv[argc - 1] == '&')) != 0)
         argv[--argc] = NULL;
+    *p_argc = argc;
     return bg;
 }
 
-int parse_redirect(char **argv, char *output_file, char *input_file)
+void change_dir(const char *path)
 {
-    int i = 0;
-    int argc = 0;
-    int status = 0;
-    int last = 0;
-    while (argv[i] != NULL) {
-        if (strcmp(argv[i], ">") == 0) {
-            last = REDIRECT_OUT;
-        } else if (strcmp(argv[i], "<") == 0) {
-            last = REDIRECT_IN;
+    if (chdir(path) < 0) {
+        if (errno == ENOTDIR) {
+            printf("cd: %s: Not a directory\n", path);
+        } else if (errno == ENOENT) {
+            printf("cd: %s: No such file or directory\n", path);
         } else {
-            if (last == 0) {
-                argv[argc++] = argv[i];
-            } else if (last == REDIRECT_OUT) {
-                strcpy(output_file, argv[i]);
-                status |= REDIRECT_OUT;
-            } else if (last == REDIRECT_IN) {
-                strcpy(input_file, argv[i]);
-                status |= REDIRECT_IN;
-            }
-            last = 0;
-        }
-        i++;
-    }
-    argv[argc] = NULL;
-    return status;
-}
-
-int parse_pipe(char **argv, int *cmd_postions)
-{
-    int i = 0;
-    int j = 1;
-    cmd_postions[0] = 0;
-    while (argv[i] != NULL) {
-        if (strcmp(argv[i], "|") == 0 && i != 0) {
-            if (i != MAXARGS - 1 && argv[i + 1] != NULL) {
-                cmd_postions[j++] = i + 1;
-            }
-            argv[i] = NULL;
-        }
-        i++;
-    }
-    return j;
-}
-
-void save_history(const char *cmd)
-{
-    strcpy(cmdlines[current], cmd);
-    current = (current + 1) % HISTORY_LIMIT;
-}
-
-void history_exec(int start, int n)
-{
-    int bg;                 /* Should the job run in bg or fg? */
-    const char *cmd;
-    char *argv[MAXARGS];    /* Argument list execve() */
-    char buf[MAXLINE];
-    if (0 <= start && start < HISTORY_LIMIT) {
-        for (int i = 0; i < n; i++) {
-            cmd = cmdlines[(start + i) % HISTORY_LIMIT];
-            if (strlen(cmd) != 0) {
-                strcpy(buf, cmd);
-                bg = parseline(buf, argv);
-                if (argv[0] != NULL) {
-                    run(cmd, bg, argv);
-                }
-            }
+            printf("cd: %s: fail to change directory\n", path);
         }
     }
-}
-
-/*
- * first_tok - Returns a pointer to the first (lowest addy) of the four pointers
- *     that isn't NULL.
- */
-char *first_tok(const char *space, const char *input, const char *output, const char *pipe)
-{
-    const char *possible[4];
-    unsigned long min;
-    int n = 0;
-    if (space == NULL && input == NULL && output == NULL && pipe == NULL)
-        return NULL;
-    if (space != NULL) {
-        possible[n++] = space;
-    }
-    if (input != NULL) {
-        possible[n++] = input;
-    }
-    if (output != NULL) {
-        possible[n++] = output;
-    }
-    if (pipe != NULL) {
-        possible[n++] = pipe;
-    }
-    min = (unsigned long) possible[0];
-    for (int i = 1; i < n; i++) {
-        if (((unsigned long) possible[i]) < min)
-            min = (unsigned long) possible[i];
-    }
-    return (char *) min;
-}
-
-/*
- * usage - print a help message
- */
-void usage(void)
-{
-    printf("Usage: shell [-hvp]\n");
-    printf("   -h   print this message\n");
-    printf("   -p   do not emit a command prompt\n");
-    exit(1);
 }
