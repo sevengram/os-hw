@@ -1,5 +1,5 @@
 /*
- * tsh - A tiny shell program with job control
+ * tsh - A tiny shell program
  *
  * jianxiang.fan@colorado.edu - Jianxiang Fan
  */
@@ -10,13 +10,14 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/wait.h>
-#include <linux/limits.h>
 #include <fcntl.h>
 #include <errno.h>
 
 #include "errmsg.h"
 #include "job.h"
 #include "sigutil.h"
+#include "stack.h"
+#include "util.h"
 
 /* Misc manifest constants */
 #define MAXLINE         1024  /* max line size */
@@ -24,37 +25,30 @@
 #define MAXPIPE         128
 #define HISTORY_LIMIT   256
 
-#define REDIRECT_OUT    0x1
-#define REDIRECT_IN     0x2
-
-#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
-#define SUB(X, Y) (((X) > (Y)) ? ((X)-(Y)) : ((Y)-(X)))
-
-
 /* command line prompt */
 static int current = 0;
 
-static char cmdlines[HISTORY_LIMIT][MAXLINE];
+static char cmd_history[HISTORY_LIMIT][MAXLINE];
 
 static char cwd[MAXLINE];
 
-void eval(const char *cmdline);
+static char buf[MAXLINE];
 
-void fork_run(const char *cmdline, char **argv, int bg);
+void eval(const char *cmdline);
 
 int parse_line(const char *cmdline, int *p_argc, char **argv);
 
-int parse_redirect(char **argv, char *output_file, char *input_file);
+int parse_pipe(int argc, char **argv, int *cmd_postions);
 
-int parse_pipe(char **argv, int *cmd_postions);
-
-int pipe_exec(char **argv, int *pos, int cmd_count);
+void parse_redirect(char **argv, int *input_fd, int *output_fd);
 
 void history_exec(int start, int n);
 
 void save_history(const char *cmd);
 
 void change_dir(const char *path);
+
+int subs_exec(int argc, char **argv);
 
 void usage(void);
 
@@ -129,79 +123,24 @@ int main(int argc, char **argv)
     exit(0); /* control never reaches here */
 }
 
-
-int single_exec(char **argv)
+void single_exec(char **argv, int input_fd, int output_fd)
 {
-    char output_file[NAME_MAX];
-    char input_file[NAME_MAX];
-    int status = parse_redirect(argv, output_file, input_file);
-    int fd;
-    if (status & REDIRECT_OUT) {
-        if ((fd = open(output_file, O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
-            app_error("Fail to create the file!");
-            return -1;
-        }
-        dup2(fd, STDOUT_FILENO);
-        close(fd);
+    parse_redirect(argv, &input_fd, &output_fd);
+    if (output_fd != -1) {
+        dup2(output_fd, STDOUT_FILENO);
+        close(output_fd);
     }
-    if (status & REDIRECT_IN) {
-        if ((fd = open(input_file, O_RDONLY)) == -1) {
-            app_error("Fail to open the file!");
-            return -1;
-        }
-        dup2(fd, STDIN_FILENO);
-        close(fd);
+    if (input_fd != -1) {
+        dup2(input_fd, STDIN_FILENO);
+        close(input_fd);
     }
     if (execvp(argv[0], argv) < 0) {
         fprintf(stderr, "%s: Command not found.\n", argv[0]);
-        return -1;
-    }
-    return 0;
-}
-
-int line_exec(char **argv)
-{
-    int cmd_postions[MAXPIPE];
-    int cmd_count = parse_pipe(argv, cmd_postions);
-    if (cmd_count > 1) {
-        return pipe_exec(argv, cmd_postions, cmd_count);
-    } else {
-        return single_exec(argv);
+        exit(1);
     }
 }
 
-void fork_run(const char *cmdline, char **argv, int bg)
-{
-    pid_t pid;
-    mask_signal(SIG_BLOCK, SIGCHLD);
-
-    if ((pid = fork()) == 0) {   /* Child */
-        mask_signal(SIG_UNBLOCK, SIGCHLD);
-        if (setpgid(0, 0) < 0) { /* put the child in a new process group */
-            unix_error("eval: setpgid failed");
-        }
-        if (line_exec (argv) == 0) {
-            exit(0);
-        } else {
-            exit(1);
-        }
-    } else {/* Parent */
-        if (!bg)
-            addjob(jobs, pid, FG, cmdline);
-        else
-            addjob(jobs, pid, BG, cmdline);
-
-        mask_signal(SIG_UNBLOCK, SIGCHLD);
-
-        /* handle the started job */
-        if (!bg)
-            waitfg(pid, STDOUT_FILENO);
-        else
-            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
-    }
-}
-
-int pipe_exec(char **argv, int *pos, int cmd_count)
+void pipe_exec(char **argv, int *pos, int cmd_count)
 {
     int i, j, k;
     int result;
@@ -211,7 +150,7 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
     for (i = 0; i < pipe_count; i++) {
         if (pipe(pipefds + i * 2) < 0) {
             fprintf(stderr, "couldn't pipe");
-            return -1;
+            exit(1);
         }
     }
     j = 0;
@@ -229,9 +168,7 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
                     close(pipefds[k]);
                 }
             }
-            if (single_exec(argv + pos[i]) < 0) {
-                exit(1);
-            }
+            single_exec(argv + pos[i], -1, -1);
         }
     }
     for (i = 0; i < 2 * pipe_count; i++) {
@@ -241,7 +178,18 @@ int pipe_exec(char **argv, int *pos, int cmd_count)
         wait(&status);
         result |= status;
     }
-    return result == 0 ? 0 : -1;
+    exit(result);
+}
+
+void line_exec(int argc, char **argv, int input_fd, int output_fd)
+{
+    int cmd_postions[MAXPIPE];
+    int cmd_count = parse_pipe(argc, argv, cmd_postions);
+    if (cmd_count > 1) {
+        pipe_exec(argv, cmd_postions, cmd_count);
+    } else {
+        single_exec(argv, input_fd, output_fd);
+    }
 }
 
 /*
@@ -274,8 +222,8 @@ int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
         if (argc >= 3 && argv[1][0] == '-' && argv[2][0] == '-') {
             int a = atoi(argv[1] + 1);
             int b = atoi(argv[2] + 1);
-            int start = (current - MAX(a, b) + HISTORY_LIMIT) % HISTORY_LIMIT;
-            history_exec(start, SUB(a, b) + 1);
+            int start = (current - max(a, b) + HISTORY_LIMIT) % HISTORY_LIMIT;
+            history_exec(start, sub(a, b) + 1);
         } else {
             fprintf(stderr, "fc: argument error!\n");
         }
@@ -299,70 +247,93 @@ int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
 void eval(const char *cmdline)
 {
     char *argv[MAXARGS];    /* Argument list execve() */
-    char buf[MAXLINE];
     int bg;                 /* Should the job run in bg or fg? */
     int argc;
-    strcpy(buf, cmdline);
-    bg = parse_line(buf, &argc, argv);
+    bg = parse_line(cmdline, &argc, argv);
     if (argv[0] != NULL && !builtin_cmd(argc, argv, STDIN_FILENO, STDOUT_FILENO)) {
-        fork_run(cmdline, argv, bg);
+        pid_t pid;
+        mask_signal(SIG_BLOCK, SIGCHLD);
+        if ((pid = fork()) == 0) {   /* Child */
+            mask_signal(SIG_UNBLOCK, SIGCHLD);
+            if (setpgid(0, 0) < 0) { /* put the child in a new process group */
+                unix_error("eval: setpgid failed");
+            }
+            if (subs_exec(argc, argv) == 0) {
+                exit(0);
+            }
+            exit(1);
+        } else {/* Parent */
+            if (!bg)
+                addjob(jobs, pid, FG, cmdline);
+            else
+                addjob(jobs, pid, BG, cmdline);
+
+            mask_signal(SIG_UNBLOCK, SIGCHLD);
+
+            /* handle the started job */
+            if (!bg)
+                waitfg(pid, STDOUT_FILENO);
+            else
+                printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+        }
     }
     if (argv[0] != NULL && strcmp(argv[0], "fc") != 0) {
         save_history(cmdline);
     }
-    return;
 }
 
-
-int parse_redirect(char **argv, char *output_file, char *input_file)
+void parse_redirect(char **argv, int *input_fd, int *output_fd)
 {
     int i = 0;
     int argc = 0;
-    int status = 0;
     int last = 0;
+    int fd;
     while (argv[i] != NULL) {
         if (strcmp(argv[i], ">") == 0) {
-            last = REDIRECT_OUT;
+            last = 1;
         } else if (strcmp(argv[i], "<") == 0) {
-            last = REDIRECT_IN;
+            last = 2;
         } else {
             if (last == 0) {
                 argv[argc++] = argv[i];
-            } else if (last == REDIRECT_OUT) {
-                strcpy(output_file, argv[i]);
-                status |= REDIRECT_OUT;
-            } else if (last == REDIRECT_IN) {
-                strcpy(input_file, argv[i]);
-                status |= REDIRECT_IN;
+            } else if (last == 1) {
+                if ((fd = open(argv[i], O_CREAT | O_TRUNC | O_RDWR, 0644)) == -1) {
+                    app_error("Fail to create the file!");
+                } else {
+                    *output_fd = fd;
+                }
+            } else if (last == 2) {
+                if ((fd = open(argv[i], O_RDONLY)) == -1) {
+                    app_error("Fail to open the file!");
+                } else {
+                    *input_fd = fd;
+                }
             }
             last = 0;
         }
         i++;
     }
     argv[argc] = NULL;
-    return status;
 }
 
-int parse_pipe(char **argv, int *cmd_postions)
+int parse_pipe(int argc, char **argv, int *cmd_postions)
 {
-    int i = 0;
     int j = 1;
     cmd_postions[0] = 0;
-    while (argv[i] != NULL) {
+    for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "|") == 0 && i != 0) {
-            if (i != MAXARGS - 1 && argv[i + 1] != NULL) {
+            if (i < argc - 1) {
                 cmd_postions[j++] = i + 1;
             }
             argv[i] = NULL;
         }
-        i++;
     }
     return j;
 }
 
 void save_history(const char *cmd)
 {
-    strcpy(cmdlines[current], cmd);
+    strcpy(cmd_history[current], cmd);
     current = (current + 1) % HISTORY_LIMIT;
 }
 
@@ -371,23 +342,80 @@ void history_exec(int start, int n)
     const char *cmd;
     if (0 <= start && start < HISTORY_LIMIT) {
         for (int i = 0; i < n; i++) {
-            cmd = cmdlines[(start + i) % HISTORY_LIMIT];
+            cmd = cmd_history[(start + i) % HISTORY_LIMIT];
             eval(cmd);
         }
     }
+}
+
+int subs_exec(int argc, char **argv)
+{
+    char *subargv[argc];
+    char *arg;
+    int i, j;
+    int size;
+    int fds[2];
+    int buf_pos = 0;
+    int flag = 0;
+    int cmd_count = 0;
+    int status;
+    int result = 0;
+    stack s = create_stack(argc);
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], ")") != 0) {
+            push(s, argv[i]);
+        } else {
+            j = 0;
+            while (!is_empty(s)) {
+                arg = top_and_pop(s);
+                if (!strcmp(arg, "<(")) {
+                    subargv[j] = NULL;
+                    flag = 0;
+                    break;
+                } else if (!strcmp(arg, ">(")) {
+                    subargv[j] = NULL;
+                    flag = 1;
+                    break;
+                } else {
+                    subargv[j++] = arg;
+                }
+            }
+            reverse_array(subargv, j);
+            pipe(fds);
+            if (fork() == 0) {
+                close(fds[flag]);
+                line_exec(j, subargv, !flag ? -1 : fds[1 - flag], flag ? -1 : fds[1 - flag]);
+            } else {
+                close(fds[1 - flag]);
+                size = sprintf(buf + buf_pos, "/proc/%d/fd/%d", getpid(), fds[flag]) + 1;
+                push(s, buf + buf_pos);
+                buf_pos += size;
+            }
+        }
+    }
+    j = 0;
+    while (!is_empty(s)) {
+        subargv[j++] = top_and_pop(s);
+    }
+    subargv[j] = NULL;
+    reverse_array(subargv, j);
+    line_exec(j, subargv, -1, -1);
+    for (i = 0; i < cmd_count; i++) {
+        wait(&status);
+        result |= status;
+    }
+    exit(result);
 }
 
 /*
  * first_tok - Returns a pointer to the first (lowest addy) of the four pointers
  *     that isn't NULL.
  */
-char *first_tok(const char *space, const char *input, const char *output, const char *pipe)
+char *first_tok(const char *space, const char *input, const char *output, const char *pipe, const char *right)
 {
-    const char *possible[4];
+    const char *possible[5];
     unsigned long min;
     int n = 0;
-    if (space == NULL && input == NULL && output == NULL && pipe == NULL)
-        return NULL;
     if (space != NULL) {
         possible[n++] = space;
     }
@@ -399,6 +427,12 @@ char *first_tok(const char *space, const char *input, const char *output, const 
     }
     if (pipe != NULL) {
         possible[n++] = pipe;
+    }
+    if (right != NULL) {
+        possible[n++] = right;
+    }
+    if (n == 0) {
+        return NULL;
     }
     min = (unsigned long) possible[0];
     for (int i = 1; i < n; i++) {
@@ -432,6 +466,7 @@ int parse_line(const char *cmdline, int *p_argc, char **argv)
     char *delim_in;             /* points to the first < delimiter */
     char *delim_out;            /* points to the first > delimiter */
     char *delim_pipe;           /* points to the first | delimiter */
+    char *delim_right;          /* points to the first ) delimiter */
     char *delim;                /* points to the first delimiter */
     int argc;               /* number of args */
     int bg;                     /* background job? */
@@ -448,31 +483,59 @@ int parse_line(const char *cmdline, int *p_argc, char **argv)
     delim_in = strchr(buf, '<');
     delim_out = strchr(buf, '>');
     delim_pipe = strchr(buf, '|');
-    while ((delim = first_tok(delim_space, delim_in, delim_out, delim_pipe))) {
+    delim_right = strchr(buf, ')');
+    while ((delim = first_tok(delim_space, delim_in, delim_out, delim_pipe, delim_right))) {
         if (delim == delim_space) {
-            argv[argc++] = buf;
             *delim = '\0';
+            if (strlen(buf) != 0) {
+                argv[argc++] = buf;
+            }
             last_space = delim;
         } else if (delim == delim_in) {
-            if ((last_space && last_space != (delim - 1)) || (!last_space)) {
-                argv[argc++] = buf;
+            if ((last_space && last_space != (delim - 1)) || !last_space) {
                 *delim = '\0';
+                if (strlen(buf) != 0) {
+                    argv[argc++] = buf;
+                }
             }
-            argv[argc++] = "<";
+            if (*(delim + 1) == '(') {
+                delim++;
+                argv[argc++] = "<(";
+            } else {
+                argv[argc++] = "<";
+            }
             last_space = 0;
         } else if (delim == delim_out) {
-            if ((last_space && last_space != (delim - 1)) || (!last_space)) {
-                argv[argc++] = buf;
+            if ((last_space && last_space != (delim - 1)) || !last_space) {
                 *delim = '\0';
+                if (strlen(buf) != 0) {
+                    argv[argc++] = buf;
+                }
             }
-            argv[argc++] = ">";
+            if (*(delim + 1) == '(') {
+                delim++;
+                argv[argc++] = ">(";
+            } else {
+                argv[argc++] = ">";
+            }
             last_space = 0;
         } else if (delim == delim_pipe) {
-            if ((last_space && last_space != (delim - 1)) || (!last_space)) {
-                argv[argc++] = buf;
+            if ((last_space && last_space != (delim - 1)) || !last_space) {
                 *delim = '\0';
+                if (strlen(buf) != 0) {
+                    argv[argc++] = buf;
+                }
             }
             argv[argc++] = "|";
+            last_space = 0;
+        } else if (delim == delim_right) {
+            if ((last_space && last_space != (delim - 1)) || !last_space) {
+                *delim = '\0';
+                if (strlen(buf) != 0) {
+                    argv[argc++] = buf;
+                }
+            }
+            argv[argc++] = ")";
             last_space = 0;
         }
         buf = delim + 1;
@@ -482,12 +545,11 @@ int parse_line(const char *cmdline, int *p_argc, char **argv)
         delim_in = strchr(buf, '<');
         delim_out = strchr(buf, '>');
         delim_pipe = strchr(buf, '|');
+        delim_right = strchr(buf, ')');
     }
     argv[argc] = NULL;
-
     if (argc == 0)  /* ignore blank line */
         return 1;
-
     /* should the job run in the background? */
     if ((bg = (*argv[argc - 1] == '&')) != 0)
         argv[--argc] = NULL;
