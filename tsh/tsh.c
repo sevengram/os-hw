@@ -18,6 +18,7 @@
 #include "sigutil.h"
 #include "stack.h"
 #include "util.h"
+#include "bookmark.h"
 
 /* Misc manifest constants */
 #define MAXLINE         1024  /* max line size */
@@ -61,6 +62,8 @@ int main(int argc, char **argv)
     char cmdline[MAXLINE];
     FILE *fp;
     int bash_mode = 0; /* emit prompt (default) */
+
+    load_bookmarks(NULL);
 
     /* Redirect stderr to stdout (so that driver will get all output
      * on the pipe connected to stdout) */
@@ -198,10 +201,10 @@ void line_exec(int argc, char **argv, int input_fd, int output_fd)
  */
 int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
 {
-    if (!strcmp(argv[0], "quit")) /* quit command */
+    if (!strcmp(argv[0], "quit") || !strcmp(argv[0], "exit")) {
+        save_bookmarks(NULL);
         exit(0);
-    if (!strcmp(argv[0], "exit")) /* quit command */
-        exit(0);
+    }
     if (!strcmp(argv[0], "&"))    /* Ignore singleton & */
         return 1;
     if (!strcmp(argv[0], "jobs")) {
@@ -212,6 +215,37 @@ int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
         if (argc >= 2) {
             change_dir(argv[1]);
         }
+        return 1;
+    }
+    if (!strcmp(argv[0], "cdb")) {
+        if (argc >= 2) {
+            char *path = get_bookmark(argv[1]);
+            if (!path) {
+                printf("cdb: %s: Unavailable bookmark\n", argv[1]);
+            } else {
+                change_dir(path);
+            }
+        }
+        return 1;
+    }
+    if (!strcmp(argv[0], "addb")) {
+        if (argc >= 3) {
+            char resolved_path[MAXLINE];
+            realpath(argv[2], resolved_path);
+            add_bookmark(argv[1], resolved_path);
+        }
+        return 1;
+    }
+    if (!strcmp(argv[0], "rmb")) {
+        if (argc >= 2) {
+            if (remove_bookmark(argv[1]) < 0) {
+                printf("rmb: %s: Unavailable bookmark\n", argv[1]);
+            }
+        }
+        return 1;
+    }
+    if (!strcmp(argv[0], "lsb")) {
+        list_bookmarks();
         return 1;
     }
     if (!strcmp(argv[0], "bg") || !(strcmp(argv[0], "fg"))) {
@@ -231,7 +265,6 @@ int builtin_cmd(int argc, char **argv, int input_fd, int output_fd)
     }
     return 0;
 }
-
 
 /*
  * eval - Evaluate the command line that the user has just typed in
@@ -559,7 +592,7 @@ int parse_line(const char *cmdline, int *p_argc, char **argv)
 
 void change_dir(const char *path)
 {
-    if (chdir(path) < 0) {
+    if (path != NULL && chdir(path) < 0) {
         if (errno == ENOTDIR) {
             printf("cd: %s: Not a directory\n", path);
         } else if (errno == ENOENT) {
