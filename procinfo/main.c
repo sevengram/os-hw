@@ -16,10 +16,12 @@ int getprocinfo(pid_t pid, procinfo_t *info)
         perror("ioctl /dev/procinfo");
         return 1;
     }
-    printf("pid: %d\n", info->pid);
-    printf("ppid: %d\n", info->ppid);
-    printf("start_time (monotonic): %ld.%ld\n", info->start_time.tv_sec, info->start_time.tv_nsec);
-    printf("num_sib: %d\n", info->num_sib);
+    printf("pid: %d\nppid: %d\nstart_time (monotonic): %ld.%ld\nnum_sib: %d\n",
+           info->pid,
+           info->ppid,
+           info->start_time.tv_sec,
+           info->start_time.tv_nsec,
+           info->num_sib);
     close(dev);
     return 0;
 }

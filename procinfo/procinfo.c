@@ -1,12 +1,9 @@
 #include <linux/module.h>
-#include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/errno.h>
 #include <linux/sched.h>
-#include <asm/uaccess.h>
 
 #include "procinfo.h"
 
