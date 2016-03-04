@@ -30,9 +30,24 @@ static int procinfo_close(struct inode *i, struct file *f)
     return 0;
 }
 
+static int count_list(struct list_head *list)
+{
+    int count;
+    struct list_head *p;
+    count = 0;
+    p = list;
+    while (!list_is_last(p, list)) {
+        count += 1;
+        p = p->next;
+    }
+    return count;
+}
+
+
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 static int procinfo_ioctl(struct inode *i, struct file *f, unsigned int cmd, unsigned long arg)
 #else
+
 static long procinfo_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 #endif
 {
@@ -58,7 +73,7 @@ static long procinfo_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
             info.pid = task->pid;
             info.ppid = task->parent->pid;
             info.start_time = task->start_time;
-            info.num_sib = 0;
+            info.num_sib = count_list(&task->sibling);
             if (copy_to_user(info_arg->info, &info, sizeof(procinfo_t))) {
                 return -EACCES;
             }
