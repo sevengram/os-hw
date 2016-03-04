@@ -1,0 +1,70 @@
+Assignment 1
+Jianxiang Fan
+jianxiang.fan@colorado.edu
+
+> How to build and run?
+Make sure you have installed cmake, then just run build_run.sh
+
+
+> Start point
+I took a computer system course (similar to CSCI2400) in my undergraduate program. I wrote a tiny shell at that time, which is a lab of CSAPP. It provides a simple shell framework with job control. I start this assignment based on these old codes.
+
+
+> Built-in commands
+exit - exit the shell
+quit - exit the shell
+cd - change working dir
+jobs - list the running and stopped background jobs
+bg <job> - Change a stopped background job to a running background job
+fg <job> - Change a stopped or running background job to a running in the foreground
+fc -<n1> -<n2> - Re-execute the last set of commands in the range from the last n1th command to the last n2th command
+
+(Unique feature)
+addb <bookmark> <dir> - add dir as bookmark (dir can be relative, and will be saved as absolute position)
+lsb - list saved bookmarks
+rmb <bookmark> - remove a bookmark
+cdb <bookmark> - change working dir to the bookmark
+
+
+> Features
+1. Foreground and background job controls
+
+2. I/O redirection
+
+3. Pipe
+- Support multiple pipes
+- Support pipe with I/O redirection
+
+$ ls -l | grep rw | sort
+$ ls -l | grep rw > 1.txt
+$ ls -l > 1.txt | grep rw (output nothing to stdout)
+
+4. Interactive and batch modes
+
+5. Process substitution
+- Support both >() and <()
+- Support multiple and nested substitution
+- Support substitution with pipe and I/O redirection
+
+$ cat <(ls) <(ls)
+$ ls > >(cat)
+$ cat <(cat <(ls) <(ls))
+$ cat <(ls -l | grep rw)
+$ cat <(ls -l > 1.txt) (output nothing to stdout)
+$ cat <(ls -l) > 1.txt
+
+6. Re-execute the last set of commands ('fc' command)
+
+7. (Unique feature) Bookmark
+addb <bookmark> <dir> - add dir as bookmark (dir can be relative, and will be saved as absolute position)
+lsb - list saved bookmarks
+cdb <bookmark> - change working dir to the bookmark
+rmb <bookmark> - remove a bookmark
+
+When user exiting the shell, bookmarks are recorded in a file (~/.tshinfo) for next time usage.
+
+/home/user $ addb music ./mp3
+/home/user $ lsb
+music => /home/user/mp3
+/home/user $ cdb music
+/home/user/music $ rmb music

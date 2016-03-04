@@ -6,3 +6,15 @@ test.c
 *~
 *.bak
 *.swp
+
+.tmp_versions
+
+*.layout
+*.cbp
+
+*.mod.c
+*.o
+*.ko
+*.cmd
+*.order
+*.symvers

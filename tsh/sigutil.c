@@ -105,23 +105,19 @@ void sigchld_handler(int sig)
 
     /* reap any zombies and handle status reports */
     while ((pid = waitpid(-1, &status, WUNTRACED | WNOHANG)) > 0) {
-
         if (WIFSTOPPED(status)) {
             sigtstp_handler(WSTOPSIG(status));
-        }
-        else if (WIFSIGNALED(status)) {
+        } else if (WIFSIGNALED(status)) {
             child_sig = WTERMSIG(status);
             if (child_sig == SIGINT)
                 sigint_handler(child_sig);
             else
                 unix_error("sigchld_handler: uncaught signal\n");
-        }
-        else
+        } else {
             deletejob(jobs, pid); /* remove the job */
+        }
     }
-
     if (pid == -1 && errno != ECHILD)
         unix_error("sigchld_handler: waitpid error");
-
     return;
 }

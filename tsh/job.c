@@ -217,12 +217,11 @@ void do_bgfg(char **argv, int output_fd)
     if (!strcmp("bg", cmd)) {
         printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
         job->state = BG;
-    }
-    else if (!strcmp("fg", cmd)) {
+    } else if (!strcmp("fg", cmd)) {
         job->state = FG;
         waitfg(job->pid, STDOUT_FILENO);
+    } else {
+        printf("bg/fg error: %s\n", cmd);
     }
-    else printf("bg/fg error: %s\n", cmd);
-
     return;
 }

@@ -3,4 +3,4 @@ project(os_hw)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99")
 
-add_executable(tsh tsh/tsh.c tsh/errmsg.c tsh/job.c tsh/sigutil.c tsh/stack.c tsh/util.c tsh/linked_hash_table.c tsh/bookmark.c)
+add_subdirectory(tsh)
