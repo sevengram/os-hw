@@ -44,7 +44,6 @@ static int count_list(struct list_head *list)
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 static int procinfo_ioctl(struct inode *i, struct file *f, unsigned int cmd, unsigned long arg)
 #else
-
 static long procinfo_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 #endif
 {

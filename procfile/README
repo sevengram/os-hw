@@ -1,0 +1,7 @@
+Problem 3:
+
+Call proc_create (create the proc file) when the module is initialized (loaded).
+Implement the writing operation to get pid from input (using copy_from_user) and
+reading operation to copy process info to output buffer.
+
+Run test.sh to launch the test and see the output.

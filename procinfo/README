@@ -1,0 +1,14 @@
+Problem 2:
+
+I use approach 2 (ioctl approach) to implement.
+
+typedef struct procinfo_arg {
+    pid_t pid;
+    procinfo_t *info;
+} procinfo_arg_t;
+
+This structure is used to pass the arguments to the ioctl function of the device driver module.
+The process information got from kernel is passed back to the user space by copy_to_user.
+
+main.c is used to test the device and print the result.
+Run test.sh to launch the test and see the output.

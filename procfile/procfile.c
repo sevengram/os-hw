@@ -7,15 +7,9 @@
 
 MODULE_LICENSE("Dual BSD/GPL");
 
+struct task_struct *task;
 
-static void print_tty(const char *s)
-{
-    struct tty_struct *tty;
-    tty = get_current_tty();
-    if (tty != NULL) {
-        tty->driver->ops->write(tty, s, strlen(s));
-    }
-}
+int read;
 
 static int count_list(struct list_head *list)
 {
@@ -30,19 +24,37 @@ static int count_list(struct list_head *list)
     return count;
 }
 
-ssize_t write_proc(struct file *filp, const char *buf, size_t count, loff_t *offp)
+static ssize_t read_proc(struct file *filp, char *buffer, size_t length, loff_t *offset)
 {
-    char kbuf[64];
-    char msg[1024];
-    struct task_struct *task;
+    ssize_t len;
+    if (read == 1) {
+        read = 0;
+        return 0;
+    }
+    if (task != NULL) {
+        read = 1;
+        len = sprintf(buffer, "pid: %d\r\nppid: %d\r\nstart_time (monotonic): %ld.%ld\r\nnum_sib: %d\r\n",
+                      task->pid,
+                      task->parent->pid,
+                      task->start_time.tv_sec,
+                      task->start_time.tv_nsec,
+                      count_list(&task->sibling));
+        return len;
+    }
+    return 0;
+}
+
+static ssize_t write_proc(struct file *filp, const char *buf, size_t count, loff_t *offp)
+{
     pid_t pid;
     char *endptr;
+    char kbuf[64];
 
-    if (copy_from_user(kbuf, buf, count)){
+    if (copy_from_user(kbuf, buf, count)) {
         return -EACCES;
     }
     pid = (pid_t) simple_strtol(kbuf, &endptr, 10);
-    if (endptr == NULL){
+    if (endptr == NULL) {
         return -EINVAL;
     }
     if (pid > 0) {
@@ -55,28 +67,22 @@ ssize_t write_proc(struct file *filp, const char *buf, size_t count, loff_t *off
     if (task == NULL) {
         return -EINVAL;
     }
-    sprintf(msg,"pid: %d\r\nppid: %d\r\nstart_time (monotonic): %ld.%ld\r\nnum_sib: %d\r\n",
-            task->pid,
-            task->parent->pid,
-            task->start_time.tv_sec,
-            task->start_time.tv_nsec,
-            count_list(&task->sibling));
-    print_tty(msg);
     return count;
 }
 
 static struct file_operations proc_fops = {
         .owner = THIS_MODULE,
-        .write = write_proc
+        .write = write_proc,
+        .read = read_proc
 };
 
-int proc_init(void)
+static int proc_init(void)
 {
     proc_create(PROC_ENTRY, 0666, NULL, &proc_fops);
     return 0;
 }
 
-void proc_cleanup(void)
+static void proc_cleanup(void)
 {
     remove_proc_entry(PROC_ENTRY, NULL);
 }
